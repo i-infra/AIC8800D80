@@ -181,6 +181,7 @@ ip link
 | `Opcode 0x0c03 failed: -110` | Generic `btusb` claimed the device instead of `aic_btusb` | `sudo rmmod btusb && sudo modprobe aic_btusb` |
 | `Operation not possible due to RF-kill` | Bluetooth blocked by RF-kill | `sudo rfkill unblock bluetooth && sudo hciconfig hci1 up` |
 | `/dev/rtk_btusb` appears instead of `hci0` | `CONFIG_BLUEDROID=1` (Android mode) | Re-run `install.sh` (sets `CONFIG_BLUEDROID=0`) |
+| `lsusb` hangs; unplugged devices stay in `/sys/bus/usb/devices`; `usbreset`/kworkers stuck in `D` after a rebind | `aic8800_fdrv` RX thread oopsed on a NULL `rwnx_hw`, then `kthread_stop()` hung holding the USB device lock | Reboot (enable sysrq first), then `sudo ./aic8800d80-setup.sh --force-rebuild` — see [docs/kernel-bug-probe-race-rx-oops-kthread-stop-hang.md](docs/kernel-bug-probe-race-rx-oops-kthread-stop-hang.md) |
 
 ### How do I check which driver is bound to the Bluetooth interface?
 
@@ -386,6 +387,8 @@ AIC8800D80/
 │   ├── modprobe/
 │   │   └── aic8800-bt.conf            # Prevent generic btusb from claiming AIC device
 │   └── patches/
+│       ├── aic8800_fdrv-probe-race-rx-oops-kthread-stop-hang.patch # applied by setup.sh: RX NULL-deref + USB hang fix
+│       ├── aic8800_fdrv-survey-ind-bugon-and-survey-oob.patch # applied by setup.sh: survey BUG_ON + OOB write fix
 │       ├── aic8800_fdrv-add-a69c-8d83.patch # WiFi driver VID:PID patch
 │       ├── aic_btusb-use-bluez.patch        # BT driver: BlueDroid -> BlueZ
 │       └── aic_btusb-add-a69c-8d83.patch    # BT driver VID:PID patch
@@ -393,6 +396,7 @@ AIC8800D80/
 │   ├── reverse-engineering-results.md # Full RE findings
 │   ├── reverse-engineering-guide.md   # How to RE similar devices
 │   ├── bluetooth-support.md           # Detailed BT architecture and troubleshooting
+│   ├── kernel-bug-probe-race-rx-oops-kthread-stop-hang.md # Why lsusb hangs after a rebind, and the fix
 │   └── windows-driver-analysis.md     # Windows DLL/driver analysis
 └── windows/
     └── INF/

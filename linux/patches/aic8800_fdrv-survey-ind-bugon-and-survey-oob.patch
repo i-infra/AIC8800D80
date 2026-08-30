@@ -1,0 +1,27 @@
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_msg_rx.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_msg_rx.c
+@@ -52,7 +52,12 @@
+         }
+     }
+ 
+-    BUG_ON(1);
++    /* ind->freq is supplied by the firmware. A value that is not in any band
++     * we registered must not be fatal: it happens with a survey indication
++     * left over from a previous driver instance (fast unbind/bind), and
++     * BUG_ON() here kills the RX kthread for a merely unexpected input.
++     * Report no-match instead and let the caller drop the indication. */
++    return -1;
+ 
+ exit:
+     // Channel has been found, return the index
+@@ -326,7 +331,9 @@
+ 
+     RWNX_DBG(RWNX_FN_ENTRY_STR);
+ 
+-    if (idx >  ARRAY_SIZE(rwnx_hw->survey))
++    /* was `idx > ARRAY_SIZE(...)`, which let idx == ARRAY_SIZE through and
++     * wrote one element past the end of rwnx_hw->survey[SCAN_CHANNEL_MAX]. */
++    if (idx < 0 || idx >= ARRAY_SIZE(rwnx_hw->survey))
+         return 0;
+ 
+     rwnx_survey = &rwnx_hw->survey[idx];

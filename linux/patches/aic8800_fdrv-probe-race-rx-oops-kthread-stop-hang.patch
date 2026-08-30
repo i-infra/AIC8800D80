@@ -1,0 +1,332 @@
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_msg_rx.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_msg_rx.c
+@@ -1727,19 +1727,49 @@
+ #endif /* CONFIG_RWNX_FULLMAC */
+ };
+ 
++/* Number of entries in each msg_hdlrs[] row, so a message id from the firmware
++ * can be range-checked before it is used as an array index. */
++static const u16 msg_hdlrs_len[] = {
++    [TASK_MM]    = MSG_I(MM_MAX),
++    [TASK_DBG]   = MSG_I(DBG_MAX),
++#ifdef CONFIG_RWNX_FULLMAC
++    [TASK_TDLS]  = MSG_I(TDLS_MAX),
++    [TASK_SCANU] = MSG_I(SCANU_MAX),
++    [TASK_ME]    = MSG_I(ME_MAX),
++    [TASK_SM]    = MSG_I(SM_MAX),
++    [TASK_APM]   = MSG_I(APM_MAX),
++    [TASK_MESH]  = MSG_I(MESH_MAX),
++#endif /* CONFIG_RWNX_FULLMAC */
++};
++
+ /**
+  *
+  */
+ void rwnx_rx_handle_msg(struct rwnx_hw *rwnx_hw, struct ipc_e2a_msg *msg)
+ {
+-	//printk("%s(%d) MSG_T(msg->id):%d MSG_I(msg->id):%d cmd:%s\r\n", __func__, 
+-	//	msg->id,
+-	//	MSG_T(msg->id), 
+-	//	MSG_I(msg->id),
+-	//	rwnx_id2str[MSG_T(msg->id)][MSG_I(msg->id)]);
+-	
+-    rwnx_hw->cmd_mgr->msgind(rwnx_hw->cmd_mgr, msg,
+-                            msg_hdlrs[MSG_T(msg->id)][MSG_I(msg->id)]);
++    unsigned int task = MSG_T(msg->id);
++    unsigned int idx  = MSG_I(msg->id);
++
++    /* The bus RX threads and URBs are started (aicwf_bus_init/aicwf_bus_start)
++     * before rwnx_cfg80211_init() allocates rwnx_hw and stores it in
++     * usbdev->rwnx_hw. A confirmation left over in the chip from a previous
++     * driver instance (fast unbind/bind, usbreset) arrives in that window with
++     * rwnx_hw == NULL. Dereferencing it oopses the RX kthread, which in turn
++     * makes the later kthread_stop() in aicwf_rx_deinit() hang forever. */
++    if (unlikely(!rwnx_hw || !rwnx_hw->cmd_mgr || !rwnx_hw->cmd_mgr->msgind)) {
++        AICWFDBG(LOGERROR, "%s: msg id 0x%x dropped, driver not ready (rwnx_hw=%p)\n",
++                 __func__, msg->id, rwnx_hw);
++        return;
++    }
++
++    if (unlikely(task >= ARRAY_SIZE(msg_hdlrs) || !msg_hdlrs[task] ||
++                 idx >= msg_hdlrs_len[task])) {
++        AICWFDBG(LOGERROR, "%s: msg id 0x%x (task %u idx %u) out of range, dropped\n",
++                 __func__, msg->id, task, idx);
++        return;
++    }
++
++    rwnx_hw->cmd_mgr->msgind(rwnx_hw->cmd_mgr, msg, msg_hdlrs[task][idx]);
+ }
+ 
+ void rwnx_rx_handle_print(struct rwnx_hw *rwnx_hw, u8 *msg, u32 len)
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_txrxif.h
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_txrxif.h
+@@ -11,6 +11,8 @@
+ 
+ #include <linux/skbuff.h>
+ #include <linux/sched.h>
++#include <linux/sched/task.h>
++#include <linux/kthread.h>
+ #include "ipc_shared.h"
+ #include "aicwf_rx_prealloc.h"
+ #ifdef AICWF_SDIO_SUPPORT
+@@ -20,6 +22,34 @@
+ #endif
+ 
+ #define CMD_BUF_MAX                 1536
++
++/*
++ * Stop one of the bus kthreads and drop the reference taken on it at creation.
++ *
++ * kthread_stop() waits for the thread to return from its function. A thread
++ * that died in an oops never returns, so kthread_stop() on it blocks forever
++ * (with the kernel's own refcount warning about the freed task_struct). That
++ * wait happens inside the USB probe/disconnect path holding the device lock,
++ * which then wedges the whole USB subtree until reboot. Detect the dead
++ * thread and skip the wait instead. The reference (get_task_struct at
++ * kthread_run time) is what makes reading the task fields safe here.
++ *
++ * PF_EXITING is set at the top of do_exit(); exit_state only in exit_notify()
++ * near its end. Checking both catches a thread that oopsed but has not yet
++ * finished dying. Both fields exist on every kernel this driver supports.
++ */
++static inline void aicwf_kthread_stop_safe(struct task_struct *t, const char *what)
++{
++    if (!t)
++        return;
++    if (READ_ONCE(t->exit_state) || (READ_ONCE(t->flags) & PF_EXITING)) {
++        pr_err("aicwf: %s (pid %d) already died; skipping kthread_stop to avoid hang\n",
++               what, t->pid);
++    } else {
++        kthread_stop(t);
++    }
++    put_task_struct(t);
++}
+ #define DATA_BUF_MAX                2048
+ #define TXPKT_BLOCKSIZE             512
+ #define MAX_AGGR_TXPKT_LEN          (1536*64)
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_txrxif.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_txrxif.c
+@@ -120,6 +120,11 @@
+ #ifdef AICWF_USB_SUPPORT
+     bus_if->busrx_thread = kthread_run(usb_busrx_thread, (void *)bus_if->bus_priv.usb->rx_priv, "aicwf_busrx_thread");
+     bus_if->bustx_thread = kthread_run(usb_bustx_thread, (void *)bus_if, "aicwf_bustx_thread");
++    /* references dropped in aicwf_kthread_stop_safe() */
++    if (!IS_ERR(bus_if->busrx_thread))
++        get_task_struct(bus_if->busrx_thread);
++    if (!IS_ERR(bus_if->bustx_thread))
++        get_task_struct(bus_if->bustx_thread);
+ 
+ #if 1
+ 	//waiting for rx/tx thread init finish
+@@ -141,6 +146,8 @@
+ 	if(bus_if->bus_priv.usb->msg_in_pipe)
+ 	{
+ 		bus_if->msg_busrx_thread = kthread_run(usb_msg_busrx_thread, (void *)bus_if->bus_priv.usb->rx_priv, "aicwf_msg_busrx_thread");
++		if (!IS_ERR(bus_if->msg_busrx_thread))
++			get_task_struct(bus_if->msg_busrx_thread);
+ 	}
+ #endif
+ 
+@@ -247,7 +254,7 @@
+ 
+ 
+ 		complete_all(&bus_if->bustx_trgg);
+-        kthread_stop(bus_if->bustx_thread);
++        aicwf_kthread_stop_safe(bus_if->bustx_thread, "aicwf_bustx_thread");
+         bus_if->bustx_thread = NULL;
+     }
+ 
+@@ -426,7 +433,10 @@
+ 			rwnx_frame_parser((char*)__func__, skb_inblock->data + 60, aggr_len - 60);
+ #endif
+ #endif
+-			rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb, (void *)rx_priv);
++			if (likely(rx_priv->usbdev->rwnx_hw))
++			    rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb, (void *)rx_priv);
++			else
++			    dev_kfree_skb(skb); /* driver not ready yet, drop */
+ 			///TODO: here need to add rx data process
+ 			//skb_pull(skb, adjust_len);
+ 		}
+@@ -447,7 +457,7 @@
+ 			if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_CMD_RSP)
+ 					rwnx_rx_handle_msg(rx_priv->usbdev->rwnx_hw, (struct ipc_e2a_msg *)(msg + 4));
+ 
+-				if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM)
++				if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM && rx_priv->usbdev->rwnx_hw)
+ 					aicwf_usb_host_tx_cfm_handler(&(rx_priv->usbdev->rwnx_hw->usb_env), (u32 *)(msg + 4));
+ 			skb_pull(skb, adjust_len+4);
+ 			kfree(msg);
+@@ -606,7 +616,10 @@
+ 
+                     skb_put(skb_inblock, aggr_len);
+                     memcpy(skb_inblock->data, data, aggr_len);
+-                    rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb_inblock, (void *)rx_priv);
++                    if (likely(rx_priv->usbdev->rwnx_hw))
++                        rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb_inblock, (void *)rx_priv);
++                    else
++                        dev_kfree_skb(skb_inblock); /* driver not ready yet, drop */
+                     buffer->read = buffer->read + aggr_len;
+                     buffer->len -= aggr_len;
+                 }
+@@ -628,7 +641,7 @@
+                     if(((*(msg + 2) & 0x7f) == USB_TYPE_CFG_CMD_RSP) && (rx_priv->usbdev->bus_if->state != (int)USB_DOWN_ST))
+                         rwnx_rx_handle_msg(rx_priv->usbdev->rwnx_hw, (struct ipc_e2a_msg *)(msg + 4));
+ 
+-                    if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM)
++                    if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM && rx_priv->usbdev->rwnx_hw)
+                         aicwf_usb_host_tx_cfm_handler(&(rx_priv->usbdev->rwnx_hw->usb_env), (u32 *)(msg + 4));
+ 
+                     if ((*(msg + 2) & 0x7f) == USB_TYPE_CFG_PRINT)
+@@ -684,7 +697,10 @@
+ 
+                 skb_put(skb_inblock, pkt_len + RX_HWHRD_LEN);
+                 memcpy(skb_inblock->data, data, pkt_len + RX_HWHRD_LEN);
+-                rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb_inblock, (void *)rx_priv);
++                if (likely(rx_priv->usbdev->rwnx_hw))
++                    rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb_inblock, (void *)rx_priv);
++                else
++                    dev_kfree_skb(skb_inblock); /* driver not ready yet, drop */
+             }
+             else { //  type : config
+                 aggr_len = pkt_len;
+@@ -704,7 +720,7 @@
+                 if(((*(msg + 2) & 0x7f) == USB_TYPE_CFG_CMD_RSP) && (rx_priv->usbdev->bus_if->state != (int)USB_DOWN_ST))
+                     rwnx_rx_handle_msg(rx_priv->usbdev->rwnx_hw, (struct ipc_e2a_msg *)(msg + 4));
+ 
+-                if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM)
++                if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM && rx_priv->usbdev->rwnx_hw)
+                     aicwf_usb_host_tx_cfm_handler(&(rx_priv->usbdev->rwnx_hw->usb_env), (u32 *)(msg + 4));
+ 
+                 if ((*(msg + 2) & 0x7f) == USB_TYPE_CFG_PRINT)
+@@ -768,7 +784,10 @@
+ 
+                     skb_put(skb_inblock, aggr_len);
+                     memcpy(skb_inblock->data, data, aggr_len);
+-                    rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb_inblock, (void *)rx_priv);
++                    if (likely(rx_priv->usbdev->rwnx_hw))
++                        rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb_inblock, (void *)rx_priv);
++                    else
++                        dev_kfree_skb(skb_inblock); /* driver not ready yet, drop */
+ 
+                     ///TODO: here need to add rx data process
+ 
+@@ -793,7 +812,7 @@
+                     if(((*(msg + 2) & 0x7f) == USB_TYPE_CFG_CMD_RSP) && (rx_priv->usbdev->bus_if->state != (int)USB_DOWN_ST))
+                         rwnx_rx_handle_msg(rx_priv->usbdev->rwnx_hw, (struct ipc_e2a_msg *)(msg + 4));
+ 
+-                    if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM)
++                    if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM && rx_priv->usbdev->rwnx_hw)
+                         aicwf_usb_host_tx_cfm_handler(&(rx_priv->usbdev->rwnx_hw->usb_env), (u32 *)(msg + 4));
+ 
+                     if ((*(msg + 2) & 0x7f) == USB_TYPE_CFG_PRINT)
+@@ -837,7 +856,10 @@
+ #endif
+ 
+             if((skb->data[2] & USB_TYPE_CFG) != USB_TYPE_CFG) { // type : data
+-                rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb, (void *)rx_priv);
++                if (likely(rx_priv->usbdev->rwnx_hw))
++                    rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb, (void *)rx_priv);
++                else
++                    dev_kfree_skb(skb); /* driver not ready yet, drop */
+             }
+             else { //  type : config
+                 aggr_len = pkt_len;
+@@ -857,7 +879,7 @@
+                 if(((*(msg + 2) & 0x7f) == USB_TYPE_CFG_CMD_RSP) && (rx_priv->usbdev->bus_if->state != (int)USB_DOWN_ST))
+                     rwnx_rx_handle_msg(rx_priv->usbdev->rwnx_hw, (struct ipc_e2a_msg *)(msg + 4));
+ 
+-                if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM)
++                if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM && rx_priv->usbdev->rwnx_hw)
+                     aicwf_usb_host_tx_cfm_handler(&(rx_priv->usbdev->rwnx_hw->usb_env), (u32 *)(msg + 4));
+ 
+                 if ((*(msg + 2) & 0x7f) == USB_TYPE_CFG_PRINT)
+@@ -932,7 +954,10 @@
+ #if 0//AIDEN
+             rwnx_frame_parser((char*)__func__, skb_inblock->data + 60, aggr_len - 60);
+ #endif
+-            rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb_inblock, (void *)rx_priv);
++            if (likely(rx_priv->usbdev->rwnx_hw))
++                rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb_inblock, (void *)rx_priv);
++            else
++                dev_kfree_skb(skb_inblock); /* driver not ready yet, drop */
+             ///TODO: here need to add rx data process
+ 
+             skb_pull(skb, adjust_len);
+@@ -955,7 +980,7 @@
+             if(((*(msg + 2) & 0x7f) == USB_TYPE_CFG_CMD_RSP) && (rx_priv->usbdev->bus_if->state != (int)USB_DOWN_ST))
+                 rwnx_rx_handle_msg(rx_priv->usbdev->rwnx_hw, (struct ipc_e2a_msg *)(msg + 4));
+ 
+-            if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM)
++            if((*(msg + 2) & 0x7f) == USB_TYPE_CFG_DATA_CFM && rx_priv->usbdev->rwnx_hw)
+                 aicwf_usb_host_tx_cfm_handler(&(rx_priv->usbdev->rwnx_hw->usb_env), (u32 *)(msg + 4));
+ 
+             if ((*(msg + 2) & 0x7f) == USB_TYPE_CFG_PRINT)
+@@ -1084,14 +1109,14 @@
+ #endif
+     if (rx_priv->usbdev->bus_if->busrx_thread) {
+         complete_all(&rx_priv->usbdev->bus_if->busrx_trgg);
+-		kthread_stop(rx_priv->usbdev->bus_if->busrx_thread);
++		aicwf_kthread_stop_safe(rx_priv->usbdev->bus_if->busrx_thread, "aicwf_busrx_thread");
+         rx_priv->usbdev->bus_if->busrx_thread = NULL;
+     }
+ #ifdef CONFIG_USB_MSG_IN_EP
+ 	if(rx_priv->usbdev->msg_in_pipe){
+ 		if (rx_priv->usbdev->bus_if->msg_busrx_thread) {
+ 			complete_all(&rx_priv->usbdev->bus_if->msg_busrx_trgg);
+-			kthread_stop(rx_priv->usbdev->bus_if->msg_busrx_thread);
++			aicwf_kthread_stop_safe(rx_priv->usbdev->bus_if->msg_busrx_thread, "aicwf_msg_busrx_thread");
+ 			rx_priv->usbdev->bus_if->msg_busrx_thread = NULL;
+ 		}
+ 	}
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+@@ -1261,13 +1261,9 @@
+ 
+ 
+     while (1) {
+-		#if 0
+-        if(kthread_should_stop()) {
+-            usb_err("usb bustx thread stop 2\n");
+-            break;
+-        }
+-		#endif
+         if (!wait_for_completion_interruptible(&bus->bustx_trgg)) {
++            if (kthread_should_stop())
++                break;
+             if(usbdev->bus_if->state == BUS_DOWN_ST){
+ 				AICWFDBG(LOGINFO, "usb bustx thread will to stop\n");
+                 break;
+@@ -1326,14 +1322,10 @@
+ 	AICWFDBG(LOGINFO, "%s the current pid is:%d\n", __func__, current->pid);
+ 
+     while (1) {
+-#if 0
+-        if(kthread_should_stop()) {
+-            usb_err("usb busrx thread stop 2\n");
+-            break;
+-        }
+-#endif
+ 		//rx_priv->rx_thread_working = 0;//AIDEN
+         if (!wait_for_completion_interruptible(&bus_if->busrx_trgg)) {
++            if (kthread_should_stop())
++                break;
+             if(bus_if->state == BUS_DOWN_ST){
+ 				AICWFDBG(LOGINFO, "usb busrx thread will to stop\n");
+ 				break;
+@@ -1373,13 +1365,9 @@
+ 
+ 
+     while (1) {
+-#if 0
+-        if(kthread_should_stop()) {
+-            usb_err("usb msg busrx thread stop\n");
+-            break;
+-        }
+-#endif
+         if (!wait_for_completion_interruptible(&bus_if->msg_busrx_trgg)) {
++            if (kthread_should_stop())
++                break;
+             if(bus_if->state == BUS_DOWN_ST){
+ 		AICWFDBG(LOGINFO, "usb msg busrx thread will to stop\n");
+                 break;
