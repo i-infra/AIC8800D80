@@ -33,7 +33,7 @@ loopbacked to the antenna port.
 | `DBG_MEM_WRITE_REQ` is ACKed but **does nothing**; block write works | §M.1 | read-back on quiet RAM and RF registers |
 | ~27.4 ms fixed per-transaction latency | §K.2 | 64 single reads = 64 block reads in wall time |
 | Chip ID register `0x40500000` | §D.1 | `0xF9078820` → U03, M80 |
-| PLL frequency field `0x4034201C[29:13]`, 1.25 MHz/LSB | §B.2 | read `1950` → 2437.50 MHz = channel 6 |
+| PLL frequency field `0x4034201C[29:13]`, 1.25 MHz/LSB | §B.2 | read `1950` = `lround(2437/1.25)` = channel 6 |
 | Tone NCO `round(freq × 204.8)`, signed 14-bit wrap | §A.3, §N.2 | +4 MHz → 819; −8 MHz → −1638 |
 | Chip reboot via `DBG_START_APP_REQ` type 3 | §N.1 | device re-enumerated with different firmware |
 | RF-test channel `DBG_RFTEST_CMD_REQ` (needs `lmacfw_rf`) | §N.1 | `SET_RX` + `GET_RX_RESULT` decode live traffic |
@@ -1054,10 +1054,13 @@ So the synthesiser is a **fractional-N PLL**: `0x4034201C[29:13]` is a 17-bit
 integer word with a **1.25 MHz** step.
 
 **`0x4034201C[29:13]` is confirmed on live hardware.** Read from a running
-`368b:8d81` under normal `fmacfw` (not testmode), the field held `1950`, i.e.
-`1950 × 1.25 = 2437.50 MHz` — exactly channel 6. The decode was derived purely by
-static analysis of `testmode20.bin` yet reads out a valid channel centre under
-completely different firmware.
+`368b:8d81` under normal `fmacfw` (not testmode), the field held `1950` — which is
+exactly what the encoder produces for channel 6 (2437 MHz): `lround(2437 / 1.25)
+= lround(1949.6) = 1950`. (Decoding straight back gives `1950 × 1.25 = 2437.5`
+MHz; the extra ½ MHz is just the ½-LSB rounding, with the residue carried in the
+fractional/`sdm` word.) The decode was derived purely by static analysis of
+`testmode20.bin` yet reads out the correct channel centre under completely
+different firmware.
 
 **The `0x40342010` "sdm" reading is NOT confirmed and is probably wrong.** It was
 described here as a 2²² fractional word. On the same live read it held
@@ -1507,7 +1510,7 @@ boot-ROM mode).
 Reading `0x40500000` is 20 bytes on the wire:
 
 ```
-14 00 11 00  00 00 00 00  00 04  01 00  64 00  04 00  00 00 50 40
+10 00 11 00  00 00 00 00  00 04  01 00  64 00  04 00  00 00 50 40
 ```
 
 ### E.3 Reply framing (chip → host)

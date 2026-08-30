@@ -15,3 +15,9 @@ desktop.ini
 *.swp
 *.swo
 *~
+
+# Build artifacts (R&D tooling)
+tools/aic-memtool
+*.o
+__pycache__/
+*.pyc
