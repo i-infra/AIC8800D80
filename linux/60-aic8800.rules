@@ -1,0 +1,26 @@
+# Raw USB access to AIC8800-family adapters for aic-memtool.
+#
+# Without this the usbfs node is root:root 0664, so libusb cannot open the
+# device and aic-memtool has to run under sudo. This grants access to the
+# console user (uaccess) and to the plugdev group.
+#
+# Install:
+#   sudo install -m 0644 60-aic8800.rules /etc/udev/rules.d/60-aic8800.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   # replug the device, or: sudo udevadm trigger --action=add --subsystem-match=usb
+#
+# Scope: AIC's two vendor IDs only, matched on the parent usb_device so the rule
+# fires once per device rather than once per interface.
+#
+#   a69c  AICSemi          - 8800 / 8801 / 8800D80 / D81 / D40, boot ROM 8d80
+#   368b  AICSemi (AIC_V2) - D80X2 / D81X2 / D89X2 / D40X2, and 368b:8d81
+#
+# SECURITY NOTE: this hands any plugdev member unmediated read/write access to
+# chip memory and registers on these devices, including the eFuse programming
+# paths, which are one-time and irreversible. That is the point of the rule --
+# but it is a real widening of privilege on a shared machine. Narrow the match
+# to a single idProduct, or drop the GROUP line and rely on uaccess alone, if
+# that matters here.
+
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="a69c", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="368b", MODE="0660", GROUP="plugdev", TAG+="uaccess"
