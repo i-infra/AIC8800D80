@@ -59,7 +59,7 @@ internally consistent, but nothing has exercised them.
 | Question | Status |
 |---|---|
 | Does `0x00100000` hold live antenna RX samples under `lmacfw_rf`? | **No — resolved, thoroughly.** It is a capture buffer whose mux/trigger/format are fully mapped and drivable, but the antenna path is not routed into it. Established with the correct source-select trigger, every relevant tap (`adc_in`/`rx_data_iq`/`rc_adc`), and a live firmware patch that removed the loopback tone — a confirmed −6 dBm jammer still left no trace — §O, §P |
-| Can antenna IQ be acquired at all? | **Not from `lmacfw_rf` by any configuration or partial replay.** The capture datapath is a loopback-by-design calibration state machine (its bring-up enables the internal tone); reversed in full in §P.6. Needs *new firmware code* that routes the normal-RX baseband into `0x100000` — buildable via the live-patch channel, but a firmware-dev project, not register poking |
+| Can antenna IQ be acquired at all? | **No — closed, negative.** The on-chip capture engine is a *calibration instrument* fed by the internal loopback tone; the packet-RX datapath is a separate block with no IQ-to-RAM tap reachable by register config, capture-path firmware patching, or the driver (no CSI/raw-RX/debugfs). Proven across both firmwares, every tap, the correct trigger, live patching, and a full bring-up replay: under `fmacfw` the clocked `rx_data_iq` capture is byte-identical between runs (static) and a jammer leaves no trace — §P.6–P.8. The antenna yields only *demodulated frames* via managed/AP mode |
 | Sample rate of the capture taps | **Unknown** — no clean signal ever reached the buffer to read a bin off — §H.5, §O.5, §P.4 |
 | `0x40342010` "sdm" field meaning | **Undecoded**; the 2²² fractional reading is contradicted by a live read — §B.2 |
 | Behaviour of `memsize > 1024` on block read | **Untested** — §E |
@@ -2786,3 +2786,59 @@ calibration/loopback machinery entirely. That is a firmware-development project
 that maps the rest of this document. Everything needed to build it is now
 documented: the buffer (§O.3), the format (§O.3), the mux and source-select
 trigger (§P.1–P.2), and the live code-injection channel (§P.3).
+
+### P.7 `fmacfw` has the capture engine too — but the antenna still isn't in it
+
+The natural next idea (P.5) was `fmacfw`, the normal Wi-Fi firmware, whose RX
+baseband DSP is definitely running because it demodulates packets. It was
+analysed and driven live (with passwordless sudo for driver/monitor control and
+`uhubctl` on hand for recovery). `aic-memtool` gained a `batch` subcommand so the
+whole ~40-op datapath bring-up runs in **one** USB session (per-op process spawn
+had made it too slow, ~1 s each).
+
+Findings:
+
+* **`fmacfw` contains the identical capture engine** — same dump dispatcher and
+  mux table (`rx_data_iq = 0x44F10010`, `adc_in = 0x00F00010`, enable
+  `0x10000002`), the same `0x309` source-select capture-start, the same
+  `0x00100000` / `0x4000`-word buffer. Its dispatcher only sets the mux; it does
+  not run a loopback bring-up.
+* **During normal RX the capture engine is not clocked.** With the interface up
+  (even in monitor mode on a busy channel) a bare arm gives `end_addr = 0` — the
+  write pointer never advances. `0x40342008 |= 0x2000000` alone does not stick.
+* **Running the full `0x168CAC` bring-up (tone-enable skipped) does start the
+  capture** — `end_addr` advances to `0x500` and the mux holds — **but the data
+  is static.** `|I| std ~130`, ~65 distinct values in 8192, and two successive
+  tone-off captures are **byte-identical (0 of 160 words changed)**. Injecting a
+  −6 dBm external tone changes nothing.
+
+So under `fmacfw` the capture's `rx_data_iq` tap, once clocked, carries **no live
+signal at all** without the internal loopback tone. The tap that the capture
+engine reads is the **calibration** datapath's `rx_data_iq`, which is a different
+signal path from the one the packet demodulator uses. Enabling the capture clock
+without the loopback tone just samples an idle node.
+
+### P.8 Conclusion: the capture engine cannot see the antenna
+
+Across both firmwares, every tap, the correct trigger, live firmware patching,
+and a full live replay of the datapath bring-up, the result is the same:
+
+> The AIC8800D80's on-chip IQ capture engine (`0x40342xxx` → `0x00100000`) is a
+> **calibration instrument**. Its input is the internal loopback tone, not the
+> antenna. The receive datapath that actually demodulates over-the-air frames is
+> a **separate block** with no IQ-to-RAM tap reachable by register configuration,
+> firmware patching of the capture path, or the host driver (which exposes no CSI,
+> raw-RX, or debugfs sample interface). A signal proven to jam the live receiver
+> leaves no trace in the capture buffer under any configuration tried.
+
+Raw antenna IQ is therefore **not obtainable** from this part by the means
+available here (register access + live code patching over USB, both firmwares).
+It would require either a hardware tap the design does not expose to software, or
+firmware that can DMA the packet-RX DSP's sample stream to RAM — and nothing in
+either image indicates that stream is exposed for capture. What the chip *does*
+provide from the antenna is **demodulated frames** through normal Wi-Fi operation
+(association or AP mode); note that `aic8800_fdrv`'s *monitor* mode did not
+deliver frames to the host in testing (`rx_packets` stayed 0), so frame capture
+needs managed/AP mode rather than monitor.
+
+This closes the antenna-IQ question: fully mapped, and negative.

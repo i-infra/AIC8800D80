@@ -12,6 +12,7 @@
 //   writeb <hex-addr> <hex-val>       DBG_MEM_BLOCK_WRITE_REQ (use this one)
 //   rftest <cmd> [argbyte...]         DBG_RFTEST_CMD_REQ      (needs lmacfw_rf)
 //   reboot [delay_ms]                 DBG_START_APP_REQ type 3
+//   batch                            run w/rmw/r/poll/d ops from stdin, one session
 //
 //   AIC_RAW=1  also hexdump the raw request/reply frames
 //
@@ -274,6 +275,53 @@ static int cmd_dump(uint32_t addr, uint32_t nbytes, const char *path)
     return 0;
 }
 
+/* one-word read / block-write returning success, for batch scripting */
+static int rd1(uint32_t addr, uint32_t *out)
+{
+    unsigned char in[RXBUF];
+    if (xfer(DBG_MEM_READ_REQ, &addr, 4, in, sizeof in, DBG_MEM_READ_CFM) < 0) return -1;
+    *out = p32(in, 1); return 0;
+}
+static int wrb1(uint32_t addr, uint32_t val)
+{
+    unsigned char in[RXBUF];
+    struct { uint32_t addr, size, data; } req = { addr, 4, val };
+    return xfer(DBG_MEM_BLOCK_WRITE_REQ, &req, 12, in, sizeof in, DBG_MEM_BLOCK_WRITE_CFM) < 0 ? -1 : 0;
+}
+/* Batch: execute newline-separated ops on stdin in this one USB session.
+ *   w  <addr> <val>            block write
+ *   rmw <addr> <clr> <set>     v = (v & ~clr) | set ; block write
+ *   r  <addr>                  read + print
+ *   poll <addr> <mask> <n>     read up to n times until (v & mask)==0
+ *   d  <addr> <nbytes> <file>  block dump to file
+ * all numbers hex. '#' comment lines and blanks ignored. */
+static int cmd_batch(void)
+{
+    char line[256];
+    while (fgets(line, sizeof line, stdin)) {
+        char op[16], f[192]; uint32_t a, b, c; unsigned v = 0;
+        if (line[0] == '#' || line[0] == '\n') continue;
+        if (sscanf(line, "%15s", op) != 1) continue;
+        if (!strcmp(op, "w") && sscanf(line, "%*s %x %x", &a, &b) == 2) {
+            if (wrb1(a, b)) return 1;
+        } else if (!strcmp(op, "rmw") && sscanf(line, "%*s %x %x %x", &a, &b, &c) == 3) {
+            if (rd1(a, &v)) return 1;
+            if (wrb1(a, (v & ~b) | c)) return 1;
+        } else if (!strcmp(op, "r") && sscanf(line, "%*s %x", &a) == 1) {
+            if (rd1(a, &v)) return 1;
+            printf("[0x%08x] = 0x%08x\n", a, v);
+        } else if (!strcmp(op, "poll") && sscanf(line, "%*s %x %x %x", &a, &b, &c) == 3) {
+            for (uint32_t i = 0; i < c; i++) { if (rd1(a, &v)) return 1; if (!(v & b)) break; }
+            printf("poll [0x%08x] = 0x%08x\n", a, v);
+        } else if (!strcmp(op, "d") && sscanf(line, "%*s %x %x %191s", &a, &b, f) == 3) {
+            if (cmd_dump(a, b, f)) return 1;
+        } else {
+            fprintf(stderr, "batch: bad line: %s", line); return 2;
+        }
+    }
+    return 0;
+}
+
 static void usage(const char *p)
 {
     fprintf(stderr,
@@ -288,7 +336,7 @@ static void usage(const char *p)
 int main(int argc, char **argv)
 {
     /* every subcommand needs argv[2] except "reboot", whose delay is optional */
-    if (argc < 3 && !(argc == 2 && !strcmp(argv[1], "reboot"))) {
+    if (argc < 3 && !(argc == 2 && (!strcmp(argv[1], "reboot") || !strcmp(argv[1], "batch")))) {
         usage(argv[0]); return 2;
     }
     raw = getenv("AIC_RAW") != NULL;
@@ -352,6 +400,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "dump")  && argc > 3)
                                         rc = cmd_dump(strtoul(argv[2],NULL,16), strtoul(argv[3],NULL,16),
                                                       argc > 4 ? argv[4] : NULL);
+    else if (!strcmp(argv[1], "batch")) rc = cmd_batch();
     else { usage(argv[0]); rc = 2; }
 
     libusb_release_interface(h, ifnum);

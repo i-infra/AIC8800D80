@@ -33,7 +33,7 @@ rftest <cmd> [argbyte...]         DBG_RFTEST_CMD_REQ      (needs lmacfw_rf)
 reboot [delay_ms]                 DBG_START_APP_REQ type 3
 ```
 
-`AIC_RAW=1` also hexdumps the raw request/reply frames.
+`AIC_RAW=1` also hexdumps the raw request/reply frames. The `batch` subcommand runs `w`/`rmw`/`r`/`poll`/`d` ops from stdin in a single USB session (needed for multi-register datapath bring-ups — see doc Appendix P).
 
 > **`write` is a trap.** `DBG_MEM_WRITE_REQ` is acknowledged — the confirmation
 > even echoes your address and data back — but does **not** take effect. Use
