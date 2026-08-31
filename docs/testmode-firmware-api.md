@@ -59,7 +59,7 @@ internally consistent, but nothing has exercised them.
 | Question | Status |
 |---|---|
 | Does `0x00100000` hold live antenna RX samples under `lmacfw_rf`? | **No — resolved, thoroughly.** It is a capture buffer whose mux/trigger/format are fully mapped and drivable, but the antenna path is not routed into it. Established with the correct source-select trigger, every relevant tap (`adc_in`/`rx_data_iq`/`rc_adc`), and a live firmware patch that removed the loopback tone — a confirmed −6 dBm jammer still left no trace — §O, §P |
-| Can antenna IQ be acquired at all? | **Not by register config from `lmacfw_rf`.** Requires porting the calibration datapath bring-up, a larger firmware patch, or a different image — §P.5 |
+| Can antenna IQ be acquired at all? | **Not from `lmacfw_rf` by any configuration or partial replay.** The capture datapath is a loopback-by-design calibration state machine (its bring-up enables the internal tone); reversed in full in §P.6. Needs *new firmware code* that routes the normal-RX baseband into `0x100000` — buildable via the live-patch channel, but a firmware-dev project, not register poking |
 | Sample rate of the capture taps | **Unknown** — no clean signal ever reached the buffer to read a bin off — §H.5, §O.5, §P.4 |
 | `0x40342010` "sdm" field meaning | **Undecoded**; the 2²² fractional reading is contradicted by a live read — §B.2 |
 | Behaviour of `memsize > 1024` on block read | **Untested** — §E |
@@ -2741,3 +2741,48 @@ options, in rough order of effort:
 All three are real projects rather than the quick register pokes tried here; none
 is blocked by anything discovered so far, and the live-patch channel (P.3) makes
 iterating on (1)/(2) practical without reflashing.
+
+### P.6 The datapath bring-up, reversed — why antenna capture isn't a config change
+
+Following P.5 option 1 to its end: the capture datapath bring-up in testmode is
+`0x00168CAC`, called once at the top of the LOFT/COB calibration
+(`0x0016A50E`). It was fully disassembled and transcribed. It is **~60
+interdependent read-modify-write operations** across `0x40342008`, `0x4034202C`,
+`0x40342270/74`, `0x403420C8/D4/E0/E4/E8/EC/F0/F4`, `0x40340010` and
+`0x4034206C`, with settling delays between phases. Two things make it decisive:
+
+1. **The bring-up is a loopback setup by construction.** Among its writes is
+   `0x4034206C |= 0x10000000` — the internal-tone enable — and it programs the
+   `0x403420E0..F0` block with fixed coefficients (`0x351D`, `0x375C`, `0x35BB`,
+   `0x3719`, `0x367A`, each paired with a high-half constant like `0x0F9F0000`)
+   that are the tone/decimation mixing constants. Generating and down-converting
+   the chip's own tone is not a side effect of this datapath — it *is* the
+   datapath.
+
+2. **The bring-up alone is not enough to capture.** Replaying the whole
+   `0x168CAC` sequence live over USB — even *with* the tone-enable kept as a
+   control — did **not** reproduce the loopback-tone capture that `SET_RX_METER`
+   produces (peak/median ~8 dB, scattered, and still the short `end_addr=0x500`).
+   A working capture additionally needs the per-table tone-frequency programming
+   and arm that the calibration loop's sub-functions (`0x169288`, `0x169610`,
+   `0x169994`, …) perform. In other words the capture only works as the output of
+   the entire calibration state machine, not as a standalone datapath one can
+   point at the antenna.
+
+**Conclusion.** Live-antenna IQ is not reachable by configuring `lmacfw_rf`'s
+capture engine, by partially replaying its bring-up, or by the live-patch route
+(§P.3) — the capture path is a tightly-coupled, loopback-by-design calibration
+facility. The two firmwares are complementary and neither gives what is wanted on
+its own: `fmacfw` has the live antenna receive datapath but exposes no IQ
+capture, while `lmacfw_rf` has the capture but feeds it only the internal
+calibration tone.
+
+Getting antenna IQ therefore needs **new firmware code**, not configuration:
+a patch (loadable live via §P.3, or installed to `/lib/firmware`) that stands up
+the normal-RX baseband datapath — the one that already demodulates packets — and
+routes `rx_data_iq` into `0x00100000` with a plain one-shot arm, bypassing the
+calibration/loopback machinery entirely. That is a firmware-development project
+(write + inject a small routine and a way to call it), not the register poking
+that maps the rest of this document. Everything needed to build it is now
+documented: the buffer (§O.3), the format (§O.3), the mux and source-select
+trigger (§P.1–P.2), and the live code-injection channel (§P.3).
