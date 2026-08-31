@@ -12,6 +12,8 @@ on hardware and which are static analysis only.
 | `tinysa.py` | Python 3 | Minimal tinySA / tinySA4 serial control (`talk()`, `sweep()`) used to confirm TX output, and as an external signal generator (`mode output` + `output on`). |
 | `capture_fft.py` | Python 3 (numpy) | FFT-analyse a buffer dumped from the IQ capture engine at `0x100000`. Unpacks the lmacfw_rf format (two's-complement 12-bit, 8-byte stride) verified by disassembly; A/B compares tone on/off. See doc Appendix O. |
 | `rf_daq.py` | Python 3 | Drive the lmacfw_rf IQ capture DAQ over USB (source-select `0x309` arm, tap mux table) and optionally live-patch the running firmware to retask `SET_RX_METER`. Research scaffolding for antenna-IQ work — see doc Appendix P. |
+| `bt_patch_parse.py` | Python 3 | Decode an AIC8800 Bluetooth patch-table binary offline (records, addr/val pairs, BTMODE config map). No hardware. See [`../docs/bt-patch-table.md`](../docs/bt-patch-table.md). |
+| `bt_romdump.py` | Python 3 | Extract the BT ROM over USB via `DBG_MEM` block reads: `verify` reads back known patch words to confirm the BT address space is visible, then `dump` sweeps it with hole-skipping. Shells out to `aic-memtool`. See the BT patch-table doc. |
 
 ## `aic-memtool`
 
