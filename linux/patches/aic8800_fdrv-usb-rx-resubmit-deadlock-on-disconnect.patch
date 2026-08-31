@@ -1,0 +1,116 @@
+Fix USB RX resubmit deadlock that wedges the xHCI controller on disconnect
+
+When the adapter is unplugged (or reset) while RX URBs are in flight,
+usb_submit_urb() starts returning -ENODEV/-ESHUTDOWN. But usb_dev->state can
+still read USB_UP_ST at that moment, because the USB core has not yet run the
+driver's .disconnect callback. The RX resubmit path did not cope:
+
+  * aicwf_usb_submit_msg_rx_urb() logged the failure, put the buffer back on the
+    free list, mdelay(100)'d, and returned 0 (success). Its caller,
+    aicwf_usb_msg_rx_submit_all_urb(), loops `while (buf = buf_get()) submit(buf)`
+    and only bailed when state was already down -- so it re-fetched the very same
+    buffer and re-submitted it forever, 100 ms per iteration
+    ("usb submit msg rx urb fail:-19" spinning in dmesg).
+  * That loop runs in the URB-completion (atomic) path and never returns, so the
+    USB core's disconnect for this device never completes. usb_hub_wq blocks in
+    D state holding the device/controller locks, and every subsequent USB
+    operation on that controller -- lsusb, uhubctl, even an xhci_hcd
+    unbind/rebind -- hangs behind it. The whole xHCI controller wedges and only a
+    reboot recovers it.
+  * mdelay(100) in the completion path is itself a bug: a 100 ms busy-wait in
+    atomic context.
+
+Fixes:
+  * The submit helpers now return the real error and never mdelay(). On a
+    device-gone error they call aicwf_usb_rx_urb_submit_failed(), which forces the
+    bus to USB_DOWN_ST so *every* RX/TX resubmit path bails immediately -- this
+    trips on the first -ENODEV at unplug, before .disconnect even runs.
+  * aicwf_usb_msg_rx_submit_all_urb() now stops on ANY submit failure instead of
+    re-fetching the same buffer, matching the data-RX path.
+
+This is distinct from the probe-race / kthread_stop hang fixed separately; it is
+the resubmit-spin variant of the same "driver does not survive the device going
+away under load" family.
+
+Signed-off-by: (AIC8800D80 out-of-tree fixups)
+---
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+index b3e194b..cd9b635 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+@@ -738,6 +738,25 @@ static void aicwf_usb_msg_rx_complete(struct urb *urb)
+ }
+ #endif
+ 
++/* Forward decl (defined below): the RX resubmit paths above need to force the
++ * bus down when the device vanishes mid-transfer. */
++static void aicwf_usb_state_change(struct aic_usb_dev *usb_dev, int state);
++
++/* A resubmit that fails with a device-gone error means the adapter was unplugged
++ * or reset while RX was in flight. usb_submit_urb() can return -ENODEV/-ESHUTDOWN
++ * while usb_dev->state still reads USB_UP_ST, because the USB core disconnect
++ * callback has not run yet. Force the bus to DOWN here so every RX/TX resubmit
++ * path sees it and stops, instead of busy-looping usb_submit_urb() against a dead
++ * device -- that loop is what blocked USB disconnect and wedged the whole xHCI
++ * controller on unplug. */
++static void aicwf_usb_rx_urb_submit_failed(struct aic_usb_dev *usb_dev, int ret)
++{
++    if (ret == -ENODEV || ret == -ESHUTDOWN || ret == -ENOENT || ret == -EPROTO) {
++        if (usb_dev->state == USB_UP_ST)
++            aicwf_usb_state_change(usb_dev, USB_DOWN_ST);
++    }
++}
++
+ #ifdef CONFIG_PREALLOC_RX_SKB
+ //extern int aic_rxbuff_size;
+ static int aicwf_usb_submit_rx_urb(struct aic_usb_dev *usb_dev,
+@@ -782,9 +801,8 @@ static int aicwf_usb_submit_rx_urb(struct aic_usb_dev *usb_dev,
+         usb_unanchor_urb(usb_buf->urb);
+         aicwf_prealloc_rxbuff_free(rx_buff, &usb_dev->rx_priv->rxbuff_lock);
+         aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+-
+-        mdelay(100);
+-	    return -1;
++        aicwf_usb_rx_urb_submit_failed(usb_dev, ret);
++        return ret;
+     }else{
+     	atomic_inc(&rx_urb_cnt);
+ 	}
+@@ -841,9 +859,8 @@ static int aicwf_usb_submit_rx_urb(struct aic_usb_dev *usb_dev,
+         aicwf_dev_skb_free(usb_buf->skb);
+         usb_buf->skb = NULL;
+         aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+-
+-        mdelay(100);
+-        return -1;
++        aicwf_usb_rx_urb_submit_failed(usb_dev, ret);
++        return ret;
+     }else{
+         atomic_inc(&rx_urb_cnt);
+     }
+@@ -914,8 +931,8 @@ static int aicwf_usb_submit_msg_rx_urb(struct aic_usb_dev *usb_dev,
+         aicwf_dev_skb_free(usb_buf->skb);
+         usb_buf->skb = NULL;
+         aicwf_usb_msg_rx_buf_put(usb_dev, usb_buf);
+-
+-        mdelay(100);
++        aicwf_usb_rx_urb_submit_failed(usb_dev, ret);
++        return ret;
+     }
+     return 0;
+ }
+@@ -933,8 +950,12 @@ static void aicwf_usb_msg_rx_submit_all_urb(struct aic_usb_dev *usb_dev)
+     while((usb_buf = aicwf_usb_msg_rx_buf_get(usb_dev)) != NULL) {
+         if (aicwf_usb_submit_msg_rx_urb(usb_dev, usb_buf)) {
+             AICWFDBG(LOGERROR, "usb msg rx refill fail\n");
+-            if (usb_dev->state != USB_UP_ST)
+-                return;
++            /* Stop on ANY submit failure. The submit helper has already put the
++             * buffer back on the free list, so continuing the loop would just
++             * re-fetch and re-submit the same buffer forever. The old code only
++             * bailed when state was already down, which spun (device gone but
++             * state still USB_UP_ST) and wedged USB disconnect. */
++            return;
+         }
+     }
+ }
