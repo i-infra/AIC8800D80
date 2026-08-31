@@ -287,7 +287,10 @@ static void usage(const char *p)
 
 int main(int argc, char **argv)
 {
-    if (argc < 3) { usage(argv[0]); return 2; }
+    /* every subcommand needs argv[2] except "reboot", whose delay is optional */
+    if (argc < 3 && !(argc == 2 && !strcmp(argv[1], "reboot"))) {
+        usage(argv[0]); return 2;
+    }
     raw = getenv("AIC_RAW") != NULL;
 
     libusb_context *ctx = NULL;

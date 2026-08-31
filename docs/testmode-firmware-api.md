@@ -39,6 +39,11 @@ loopbacked to the antenna port.
 | RF-test channel `DBG_RFTEST_CMD_REQ` (needs `lmacfw_rf`) | §N.1 | `SET_RX` + `GET_RX_RESULT` decode live traffic |
 | **Transmit works** | §N.4 | −34.91 dBm at 2412.000 MHz, +54 dB over noise floor |
 | Capture engine runs; `end_addr` is a circular pointer | §M.2, §I.1 | 65205/65536 bytes rewritten per arm |
+| Firmware load base `0x120000`; initial SP (stack top) `0x1A0000` | §O.2 | live RAM matches the file byte-for-byte |
+| `lmacfw_rf` capture buffer is `0x100000`; format two's-comp 12-bit, 8-byte stride | §O.3 | disassembly of `rx_meter` measure at `0x1257a8` |
+| `SET_RX_METER` is an internal NCO loopback (not an antenna capture) | §O.4 | arm at `0x125904` enables tone bit 28; even words are a fixed int16 reference |
+| A confirmed external jammer leaves no trace in `0x100000` | §O.5 | −6 dBm CW → 0 fcsok, yet no spectral peak |
+| RF-test `GET_RSSI` (`0x52`) is an unreliable stub; `fcsok` is the RX indicator | §O.1 | RSSI static while jamming took fcsok 8→0 |
 
 ### Static analysis only — not verified on hardware
 
@@ -51,8 +56,8 @@ internally consistent, but nothing has exercised them.
 
 | Question | Status |
 |---|---|
-| Does `0x00100000` hold RF samples under `lmacfw_rf`? | **Not demonstrated.** Two controlled tone injections (out of band, then in band) produced no spectral response — §N.6 |
-| Sample rate of the capture taps | **Unknown** — §H.5 |
+| Does `0x00100000` hold live antenna RX samples under `lmacfw_rf`? | **No — resolved.** It is a capture buffer, but the only path the firmware exposes (`SET_RX_METER`) fills it with an *internal NCO loopback* tone for I/Q calibration. A confirmed −6 dBm external jammer (0 fcsok) left no trace — §O |
+| Sample rate of the capture taps | **Unknown** — no clean external tone ever reached the buffer to read a bin off — §H.5, §O.5 |
 | `0x40342010` "sdm" field meaning | **Undecoded**; the 2²² fractional reading is contradicted by a live read — §B.2 |
 | Behaviour of `memsize > 1024` on block read | **Untested** — §E |
 | `SET_TXTONE` frequency argument | **Has no effect** on output frequency in `lmacfw_rf`; output pinned to ch1 — §N.5 |
@@ -71,6 +76,12 @@ Recorded so they are not rediscovered as fact:
   (§M.2).
 * `lmacfw_rf` was said to lack tone support because `tone_on` is absent from its
   shell table. The tone code **is** present and reachable via `SET_TXTONE` (§N.1).
+* `0x1A0000` was taken (from testmode) as the `rx_meter` sample buffer. Under
+  `lmacfw_rf` it is the **initial stack pointer** — reads there are stack, not
+  samples. The real buffer is `0x00100000` (§O.2, §O.3).
+* The `lmacfw_rf` capture format was assumed identical to testmode's. It is not:
+  **two's-complement 12-bit, 8-byte stride**, vs testmode's offset-binary 4-byte
+  (§O.3).
 
 ---
 
@@ -2475,5 +2486,147 @@ samples under `lmacfw_rf`.
 A further candidate explanation, untested: the receiver may be blanked while the
 chip transmits, in which case no self-generated signal can ever appear in its own
 capture. The decisive experiment is an **external** source — which is what
-`rx_meter` was designed for (§G.1), and what the tinySA can provide via
-`mode high output`.
+`rx_meter` was designed for (§G.1), and what the tinySA can provide as a generator
+(`mode output` + `output on`).
+
+> **This experiment was since carried out — see Appendix O.** An external tone
+> confirmed to be jamming the live receiver still left no trace in `0x00100000`.
+> Disassembly of the running `lmacfw_rf` then showed why: its `SET_RX_METER`
+> capture is fed the chip's *internal* NCO tone for I/Q calibration, not the
+> antenna. The "receiver blanked" guess above is essentially correct.
+
+---
+
+## Appendix O. External-source capture, and what `0x00100000` actually is
+
+Appendices M and N left one question open: does `0x00100000` ever hold live
+receive samples under `lmacfw_rf`? This appendix settles it, using an external
+signal generator to drive a known tone into the antenna port and — crucially —
+by disassembling the running `lmacfw_rf` image rather than extrapolating from
+`testmode20.bin`. The firmware analysed is
+`lmacfw_rf_8800d80_u02.bin` (md5 `333315275bb23bac64e71b264a57b7ac`), byte-for-byte
+the image the driver installs at `/lib/firmware/aic8800_fw/USB/aic8800D80/`.
+
+**Answer: `0x00100000` is a capture buffer, but under `SET_RX_METER` it holds an
+internal NCO *loopback* signal for I/Q calibration — not the antenna. The live
+antenna receive path is not observable through it in this firmware.**
+
+### O.1 Confirming the external source (the tinySA can be heard)
+
+A tinySA4 in generator mode was set to a CW tone (`mode output`, `sweep <f> <f>
+2`, `level -6`, **`output on`**) on the same SMA loopback used for the TX
+measurement in §N.4. The generator's own `output on` is required — `mode output`
+alone arms the mode but radiates nothing, which invalidated the first attempts.
+
+Emission and reception were then proven *at capture time* using the receiver's
+own packet counter, on the busy ambient channel 6 (2437 MHz):
+
+| generator | `GET_RX_RESULT` fcsok / total |
+|---|---|
+| off | 8 / 11, 11 / 19 (packets decode normally) |
+| **on, 2437 MHz, −6 dBm** | **0 / 194** (zero decoded — classic CW jamming) |
+
+A tone strong enough to take the receiver from 8 good frames to **zero** is
+unambiguously present in the RX front end. `GET_RSSI` (cmd `0x52`), by contrast,
+barely moved and often read a fixed floor — **treat the RF-test RSSI as an
+unreliable stub; `fcsok` jamming is the trustworthy RX-liveness indicator.**
+
+### O.2 The load base and the memory map (from the live chip)
+
+The firmware image read straight back from RAM matches the file at
+**`0x00120000`**, so that is the load base. Its first vector-table word is the
+initial stack pointer: **`0x001A0000`**.
+
+That single fact retires a wrong lead: `0x001A0000` is the **top of stack**, not
+a sample buffer. The earlier idea (from testmode static analysis, §G.1) that
+`rx_meter` reads I/Q from `0x1A0000` does **not** carry over to `lmacfw_rf` —
+reads there return stack frames (full ±int16 range, band-edge FFT artefacts),
+which is exactly what a naïve capture of that region showed.
+
+### O.3 `rx_meter` measure, disassembled (buffer + true sample format)
+
+The measure routine at `0x001257a8` (it prints `sum_i`/`sum_q`/`dc_i`/`dc_q`):
+
+```
+mov.w r3, #0x00100000        ; buffer base
+ldr   r1, [r3]               ; flag = word[0]
+and   r1, r1, #1             ; ping-pong: start = 0x100000 + (~flag&1)*4
+...                          ; end = start + 0x10000  (64 KiB)
+loop:
+  ldr r3, [r5]               ; one sample word
+  Q = (r3 >> 20);  if r3<0: Q -= 0x1000     ; [31:20], sign-extended 12-bit
+  I = ubfx(r3,4,12); if bit15: I -= 0x1000   ; [15:4],  sign-extended 12-bit
+  add r5, r5, #8             ; STRIDE 8 BYTES — every other 32-bit word
+  cmp r5, r6 ; bne loop
+```
+
+So, corrected against the live firmware:
+
+* the buffer is **`0x00100000`** (not `0x1A0000`), 64 KiB;
+* samples are **one 32-bit word every 8 bytes** — the two 32-bit words per entry
+  are two interleaved taps, and `measure` reads only one of them;
+* each sample word is **two's-complement** 12-bit: `I = sx12(bits[15:4])`,
+  `Q = sx12(bits[31:20])`. This is *not* the offset-binary (`− 0x800`) form the
+  testmode `0x100000` dump engine uses (§H.2) — the two firmwares pack the same
+  bit positions with different sign conventions;
+* a ping-pong flag in `word[0]` selects which of the two interleaved halves is
+  "current".
+
+`tools/capture_fft.py` implements exactly this.
+
+### O.4 `SET_RX_METER` is an internal loopback, not an antenna capture
+
+The arm routine that fills the buffer (at `0x00125904`) is the tell:
+
+```
+[0x40342000] = 0x00F70410     ; capture source mux (an internal tap)
+... RMW on 0x4034206C ...     ; the tone-NCO register
+[0x4034206C] |= 0x10000000    ; *** enable the chip's own NCO tone (bit 28) ***
+[0x40342004] = 0x01000101 → 0x01000109   ; configure, then go
+```
+
+It **switches the chip's internal transmit tone on and captures that.** Reading
+the buffer back confirms it directly: the interleaved *even* words are a
+bit-identical, full-scale complex sinusoid (`0x7c30dfc0, 0x7fe007a0, …`, i.e.
+int16 `I`/`Q` pairs rotating at constant magnitude) that is **the same in
+tone-on and tone-off external captures** — an internally generated reference, not
+anything from the antenna. `measure` reads the *odd* words (the 12-bit tap) and
+reports the receiver's DC offsets and I/Q amplitude/phase imbalance against that
+reference. `rx_meter` here is an **I/Q-calibration loopback**, the RX counterpart
+to the LOFT/DPD tone the TX side uses.
+
+### O.5 The decisive negative
+
+With the −6 dBm external tone at **+2 MHz** offset (2439 MHz, RX on ch6 2437 MHz)
+and jamming confirmed at capture time (`fcsok` 0 vs 8–12), the tone produces **no
+peak** in the buffer, in either interleave, under any of:
+
+* `SET_RX_METER`'s own loopback capture (odd stream peak/median ~11 dB, at DC not
+  +2 MHz);
+* a manual arm with the internal tone **disabled** and the mux retasked to several
+  `adc_in`-style values (`0x00FF0000`, `0x00F70410`, `0x00F00010`): peaks collapse
+  toward DC, never +2 MHz.
+
+Manual arming without the firmware's full setup sequence (`0x40330800`, the
+`0x4034206C` field programming, the timed waits) is also unstable — successive
+arms give either fresh noise or a stuck constant (`0xc3707120`). So:
+
+> Under `lmacfw_rf`, `0x00100000` is a working capture buffer whose format is now
+> known, but the only capture path the firmware exposes over USB feeds it the
+> **internal loopback tone** for calibration. A signal proven to be jamming the
+> live receiver leaves no trace in it. Observing the antenna would require driving
+> the capture mux/route to the real RX-ADC tap and replaying the complete arm
+> sequence — routing this calibration-oriented firmware does not appear to expose.
+
+This confirms and explains the §N.6 "receiver may be blanked" hypothesis: it is
+not merely blanked, it is deliberately fed the internal tone while the meter runs.
+
+### O.6 Corrections this appendix makes to earlier sections
+
+* **`0x1A0000` is the stack top**, not the `rx_meter` buffer, under `lmacfw_rf`
+  (§G.1's `0x1A0000` is testmode-only).
+* The `lmacfw_rf` buffer format is **two's-complement, 8-byte stride**, distinct
+  from testmode's offset-binary 4-byte format (§H.2).
+* `rx_meter`/`SET_RX_METER` under `lmacfw_rf` is an **internal loopback**, so
+  §G.1's "drive a CW into the antenna port" describes the testmode intent, not
+  what this firmware's USB path actually measures.
