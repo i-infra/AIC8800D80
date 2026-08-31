@@ -40,7 +40,7 @@ RADXA_COMMIT="${AIC_RADXA_COMMIT:-df4c783b663eba1956579c681acd5e45f25c671d}"
 # an ID-table fixup here leaves the previously built modules in place and the
 # change silently never reaches the kernel. Bump whenever apply_local_fixups()
 # changes what it produces.
-LOCAL_REV="5"
+LOCAL_REV="6"
 
 # Patches shipped alongside this script (in ./patches/) that are applied on top
 # of upstream's debian/patches series. Listed explicitly rather than globbed:
@@ -57,6 +57,11 @@ LOCAL_PATCHES=(
     # rwnx_hw->survey[SCAN_CHANNEL_MAX]. Found by rebind burn-in against r4.
     # See docs/kernel-bug-probe-race-rx-oops-kthread-stop-hang.md
     aic8800_fdrv-survey-ind-bugon-and-survey-oob.patch
+    # USB RX resubmit spins forever on -ENODEV when the device is unplugged/reset
+    # under load (state still reads USB_UP_ST), blocking USB disconnect and
+    # wedging the whole xHCI controller until reboot. Found live during RF capture
+    # work. See docs/kernel-bug-usb-rx-resubmit-deadlock.md
+    aic8800_fdrv-usb-rx-resubmit-deadlock-on-disconnect.patch
 )
 
 DKMS_PKG="aic8800d80"
