@@ -112,10 +112,54 @@ into `-ENODEV` while the driver's msg-RX loop was active — reproducing the spi
 above and wedging the controller. The dmesg `usb submit msg rx urb fail:-19`
 flood was the tell that led straight to `aicwf_usb_submit_msg_rx_urb()`.
 
+## Follow-up audit (r7): the `aicwf_deinit_sem` handshake
+
+A full sweep of the driver for the same failure family found four more defects,
+all in the `aicwf_deinit_sem` / `aicwf_deinit_atomic` / `wait_disconnect_cb`
+handshake. Two are fixed by
+`aic8800_fdrv-usb-disconnect-deinit-sem-imbalance.patch` (r7):
+
+1. **Semaphore count inflates by +1 on every unplug-under-load.** The RX
+   completion error path `down()`s the semaphore and sets
+   `wait_disconnect_cb = true`; `aicwf_usb_disconnect()` then skips its own
+   `down()`, `aicwf_usb_bus_stop()` `up()`s on the RX path's behalf — and
+   disconnect's tail `up()`s **again**. `sema_init(...,1)` runs only once at
+   module load (`rwnx_mod_init`), so the count grows permanently and the
+   exclusion between disconnect teardown and `aicwf_usb_exit()` silently
+   disappears (`down_timeout()` succeeds while disconnect is mid-`kfree` —
+   use-after-free on `modprobe -r` after a hot unplug). Fixed: disconnect
+   tracks whether it took the semaphore and only releases what it acquired.
+2. **Disconnect's `!usb_dev` early return leaked the semaphore** (the check sat
+   after the `down()`), which would block every later disconnect in D state —
+   the same wedge symptom. Fixed: check before taking the semaphore.
+
+Two remain **deliberately unfixed** pending a redesign (they cannot be fixed
+minimally):
+
+3. **`down()` in URB-completion (atomic) context** (`aicwf_usb.c` ~305/~393),
+   guarded only by a racy `atomic_read`-then-`atomic_set` (check-then-act, not
+   test-and-set) and an unlocked bool. Two completions on different CPUs, or a
+   completion racing `aicwf_usb_exit()`, can both pass the guard; the loser
+   sleeps in softirq — scheduling-while-atomic. Needs the handshake moved to
+   process context (`atomic_cmpxchg` + workqueue), or the semaphore protocol
+   replaced with a completion + owner flag.
+4. **Any negative `urb->status` is treated as device-gone.** A transient
+   `-EPROTO`/`-EILSEQ`/`-EOVERFLOW` permanently stops RX resubmission and sets
+   `wait_disconnect_cb`, which also makes every scan return `-EBUSY`
+   (`rwnx_main.c` ~2903) — one bus glitch bricks the interface until replug.
+   Should distinguish fatal (`-ENODEV`/`-ENOENT`/`-ESHUTDOWN`) from transient
+   statuses and resubmit on the latter.
+
+Checked and clean during the same audit: the cmd manager (timeout + `CRASHED`
+state + drain), both TX paths (bounded waits + `usb_kill_urb`), the msg-RX
+completion error path, and the per-STA flow control.
+
 ## Status
 
-Applied as a DKMS local fixup (`aic8800d80-setup.sh`, `LOCAL_REV=6`). Not yet
-runtime-verified on hardware — the machine it was found on still needs a reboot to
-clear the current wedge before the rebuilt module can load. The change is
-compile-clean and the logic is verified by inspection against the two RX paths and
-their callers.
+Applied as a DKMS local fixup (`aic8800d80-setup.sh`, `LOCAL_REV=7`; the r6
+resubmit fix plus the r7 semaphore fixes above). Not yet runtime-verified on
+hardware — the machine it was found on still needs a reboot to clear the current
+wedge before the rebuilt module can load. `aicwf_usb.c` with all three local
+patches applied compiles clean against the running kernel's headers
+(7.0.0-30-generic); the logic is verified by inspection against the two RX paths,
+their callers, and the disconnect/exit teardown.

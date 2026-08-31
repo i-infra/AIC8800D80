@@ -1,0 +1,77 @@
+Fix aicwf_deinit_sem imbalance and NULL-path leak in USB disconnect
+
+Two defects in aicwf_usb_disconnect()'s handling of aicwf_deinit_sem, found
+while auditing the driver after the RX-resubmit wedge (see the companion
+usb-rx-resubmit-deadlock patch):
+
+1. Semaphore count inflates by +1 on every unplug-under-load. When the device
+   vanishes while RX URBs are in flight, the RX completion error path down()s
+   aicwf_deinit_sem and sets wait_disconnect_cb = true. Disconnect then SKIPS
+   its own down() (cb is true), aicwf_usb_bus_stop() up()s the semaphore on
+   the RX path's behalf -- and disconnect's tail up()s it AGAIN. sema_init()
+   runs only once at module load (rwnx_mod_init), so the count grows
+   permanently: after one hot-unplug-under-load the semaphore excludes
+   nothing, and aicwf_usb_exit()'s down_timeout() succeeds instantly even
+   while a concurrent disconnect teardown is mid-kfree (use-after-free on
+   modprobe -r after a hot unplug). Fix: track whether disconnect itself took
+   the semaphore and only release what it acquired.
+
+2. The early return for usb_dev == NULL sat AFTER the down(), returning while
+   holding the semaphore. Every subsequent disconnect would then block forever
+   in uninterruptible sleep inside usb_hub_wq -- the same D-state controller
+   wedge symptom as the resubmit spin. Fix: check usb_dev before taking the
+   semaphore.
+
+Signed-off-by: (AIC8800D80 out-of-tree fixups)
+---
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+index b3e194b..d2bc657 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+@@ -2557,18 +2557,23 @@ static void aicwf_usb_disconnect(struct usb_interface *intf)
+ {
+     struct aic_usb_dev *usb_dev =
+             (struct aic_usb_dev *) usb_get_intfdata(intf);
+-    AICWFDBG(LOGINFO, "%s Enter\r\n", __func__);
++    bool took_deinit_sem = false;
+ 
+-	if(g_rwnx_plat->wait_disconnect_cb == false){
+-		atomic_set(&aicwf_deinit_atomic, 0);
+-		down(&aicwf_deinit_sem);
+-	}
++    AICWFDBG(LOGINFO, "%s Enter\r\n", __func__);
+ 
++    /* must be checked before taking aicwf_deinit_sem: returning while holding
++     * it would block every later disconnect in D state */
+     if (!usb_dev){
+ 		AICWFDBG(LOGERROR, "%s usb_dev is null \r\n", __func__);
+         return;
+     }
+ 
++	if(g_rwnx_plat->wait_disconnect_cb == false){
++		atomic_set(&aicwf_deinit_atomic, 0);
++		down(&aicwf_deinit_sem);
++		took_deinit_sem = true;
++	}
++
+ #if 0
+ 	if(timer_pending(&usb_dev->rwnx_hw->p2p_alive_timer) && usb_dev->rwnx_hw->is_p2p_alive == 1){
+ 		printk("%s del timer rwnx_hw->p2p_alive_timer \r\n", __func__);
+@@ -2587,8 +2592,15 @@ static void aicwf_usb_disconnect(struct usb_interface *intf)
+     vfree(usb_dev->usb_rx_buf);
+     kfree(usb_dev);
+ 	AICWFDBG(LOGINFO, "%s exit\r\n", __func__);
+-	up(&aicwf_deinit_sem);
+-	atomic_set(&aicwf_deinit_atomic, 1);
++	/* When wait_disconnect_cb was true the RX error path took the semaphore
++	 * and aicwf_usb_bus_stop() already up()'d it on that path's behalf; a
++	 * second up() here would grow the count by one on every unplug-under-load
++	 * (sema_init runs only at module load) and silently void the exclusion
++	 * between disconnect teardown and module exit. */
++	if (took_deinit_sem) {
++		up(&aicwf_deinit_sem);
++		atomic_set(&aicwf_deinit_atomic, 1);
++	}
+ }
+ 
+ static int aicwf_usb_suspend(struct usb_interface *intf, pm_message_t state)
