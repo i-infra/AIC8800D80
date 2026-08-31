@@ -64,26 +64,44 @@ device unplugged
 
 ## Fix (`aic8800_fdrv-usb-rx-resubmit-deadlock-on-disconnect.patch`)
 
-* Both submit helpers now **return the real error and never `mdelay()`**.
-* On a device-gone error (`-ENODEV`/`-ESHUTDOWN`/`-ENOENT`/`-EPROTO`) they call a
-  new `aicwf_usb_rx_urb_submit_failed()` that forces the bus to `USB_DOWN_ST`. This
-  is the key hardening: it trips on the **first** `-ENODEV` at unplug — before
-  `.disconnect` runs — so every RX/TX resubmit path sees the bus is down and
-  stops, instead of any one of them busy-looping a dead device.
-* `aicwf_usb_msg_rx_submit_all_urb()` now stops on **any** submit failure rather
-  than only when the state is already down, matching the data-RX path. This alone
-  breaks the infinite loop even for transient (non-device-gone) errors.
+Minimal and self-contained -- just break the loop:
 
-## Why this hardens against the deadlock class
+* `aicwf_usb_submit_msg_rx_urb()` returns **-1 on submit failure** instead of 0,
+  so the caller sees the failure.
+* `aicwf_usb_msg_rx_submit_all_urb()` stops on **any** submit failure instead of
+  re-fetching the same buffer (it previously bailed only when the state was
+  already down -- exactly the condition that never held during the spin).
+* `mdelay(100)` is removed from all three submit paths (a 100 ms busy-wait in the
+  atomic completion context).
 
-The failure family here is "the driver does not survive the device going away
-under load." The existing `probe-race-rx-oops-kthread-stop-hang` patch covers the
-`kthread_stop()`-waits-for-a-dead-thread variant. This patch covers the
-resubmit-spin variant. The shared principle applied by both: **on any sign the
-device is gone, drive the bus to DOWN once and let every path notice and unwind —
-never retry a transfer against a dead endpoint, and never block the disconnect
-callback.** Forcing the state down at the point of first `-ENODEV` (rather than
-waiting for `.disconnect`) is what makes an unplug-under-load a clean teardown.
+That is sufficient: the spin was a single `submit_all` invocation looping
+internally, so making the submit return an error and the caller break stops it.
+The in-flight URBs then complete with `urb->status < 0`, the completion handler
+already returns without resubmitting, and `cancel_work_sync()` in
+`aicwf_usb_deinit()` stops the resubmit workqueue. No further resubmit occurs.
+
+## What was deliberately NOT done, and why
+
+An earlier draft added a helper that forced `usb_dev->state = USB_DOWN_ST` on the
+first device-gone error, to make every path bail at once. **That is unsafe here**
+and was removed. The RX-completion error path (`aicwf_usb.c` ~301, ~389) can take
+`aicwf_deinit_sem` via `down()`, and `aicwf_usb_bus_stop()` performs the matching
+`up()` **only if it does not first hit `if (usb_dev->state == USB_DOWN_ST)
+return;`**. Forcing the state down from the RX path would make `bus_stop()`
+early-return and skip that `up()`, orphaning the semaphore -- trading the
+resubmit-spin deadlock for a semaphore deadlock. Breaking the loop is enough; the
+existing teardown path (`bus_stop` -> `aicwf_usb_state_change(USB_DOWN_ST)`) sets
+the state down correctly and keeps the semaphore protocol intact.
+
+## Hardening principle
+
+The failure family is "the driver does not survive the device going away under
+load." The companion `probe-race-rx-oops-kthread-stop-hang` patch covers the
+`kthread_stop()`-waits-for-a-dead-thread variant; this covers the resubmit-spin
+variant. The safe shared principle: **on a submit/transfer error, stop retrying
+that endpoint and let the existing teardown run** -- never busy-loop a dead
+device, never `mdelay()` in atomic context, and never reach into the teardown
+state machine from the data path.
 
 ## How it was found
 
