@@ -44,6 +44,8 @@ loopbacked to the antenna port.
 | `SET_RX_METER` is an internal NCO loopback (not an antenna capture) | §O.4 | arm at `0x125904` enables tone bit 28; even words are a fixed int16 reference |
 | A confirmed external jammer leaves no trace in `0x100000` | §O.5 | −6 dBm CW → 0 fcsok, yet no spectral peak |
 | RF-test `GET_RSSI` (`0x52`) is an unreliable stub; `fcsok` is the RX indicator | §O.1 | RSSI static while jamming took fcsok 8→0 |
+| Capture source mux table + the source-select trigger `0x40342004=0x309` (holds mux) vs loopback `0x109` (reverts it) | §P.1, §P.2 | live: `rx_data_iq` mux survives a `0x309` capture |
+| Firmware code in RAM is patchable live over USB (no driver/reboot, self-restoring) | §P.3 | 2×4-byte writes removed the loopback tone — reference sinusoid vanished |
 
 ### Static analysis only — not verified on hardware
 
@@ -56,8 +58,9 @@ internally consistent, but nothing has exercised them.
 
 | Question | Status |
 |---|---|
-| Does `0x00100000` hold live antenna RX samples under `lmacfw_rf`? | **No — resolved.** It is a capture buffer, but the only path the firmware exposes (`SET_RX_METER`) fills it with an *internal NCO loopback* tone for I/Q calibration. A confirmed −6 dBm external jammer (0 fcsok) left no trace — §O |
-| Sample rate of the capture taps | **Unknown** — no clean external tone ever reached the buffer to read a bin off — §H.5, §O.5 |
+| Does `0x00100000` hold live antenna RX samples under `lmacfw_rf`? | **No — resolved, thoroughly.** It is a capture buffer whose mux/trigger/format are fully mapped and drivable, but the antenna path is not routed into it. Established with the correct source-select trigger, every relevant tap (`adc_in`/`rx_data_iq`/`rc_adc`), and a live firmware patch that removed the loopback tone — a confirmed −6 dBm jammer still left no trace — §O, §P |
+| Can antenna IQ be acquired at all? | **Not by register config from `lmacfw_rf`.** Requires porting the calibration datapath bring-up, a larger firmware patch, or a different image — §P.5 |
+| Sample rate of the capture taps | **Unknown** — no clean signal ever reached the buffer to read a bin off — §H.5, §O.5, §P.4 |
 | `0x40342010` "sdm" field meaning | **Undecoded**; the 2²² fractional reading is contradicted by a live read — §B.2 |
 | Behaviour of `memsize > 1024` on block read | **Untested** — §E |
 | `SET_TXTONE` frequency argument | **Has no effect** on output frequency in `lmacfw_rf`; output pinned to ch1 — §N.5 |
@@ -2630,3 +2633,111 @@ not merely blanked, it is deliberately fed the internal tone while the meter run
 * `rx_meter`/`SET_RX_METER` under `lmacfw_rf` is an **internal loopback**, so
   §G.1's "drive a CW into the antenna port" describes the testmode intent, not
   what this firmware's USB path actually measures.
+
+---
+
+## Appendix P. The capture DAQ pipeline, and a live-patch run at antenna IQ
+
+Appendix O showed `SET_RX_METER` captures an internal loopback tone. This
+appendix digs the whole capture data-acquisition (DAQ) pipeline out of the
+firmware images to answer the follow-up: can the same engine be pointed at the
+**live antenna** instead? The short answer is that the pipeline is fully mapped
+and can be driven, but in `lmacfw_rf` the antenna receive path does not reach the
+capture buffer — established here with the correct trigger, every relevant tap,
+and a live firmware patch.
+
+### P.1 The tap mux (from testmode's `dump` dispatcher, `0x00164D44`)
+
+Each capture source writes a fixed word to the mux register **`0x40342000`** and
+a 3-bit path-select into the low nibble of **`0x4034202C`** (`(old & ~0xff) |
+(old & 0x70) | pathsel`). `0x40330800 = 0x10000002` is written first as a global
+enable. The full table:
+
+| id | source | `0x40342000` | pathsel |
+|---:|---|---|---:|
+| 0 | loft_pwr_in_out | `0x55F20010` | (uses `0x40342180`) |
+| 1 | dac_150m | `0x00F30010` | 1 |
+| 2 | **adc_in** (raw ADC) | `0x00F00010` | 2 |
+| 3 | **rx_data_iq** (post-decim baseband) | `0x44F10010` | 0 |
+| 10 | loft out | `0x44F20010` | 0 |
+| 30 | rc_adc | `0x00F10010` | 0 |
+| 31 | dccancel out | `0x11F10010` | 0 |
+| 32 | pre_dgc out | `0x22F10010` | 0 |
+| 33 | notch out | `0x33F10010` | 0 |
+| 4/50 | rc_in_iq | `0x00F50010` | 0 |
+| 5 | rc_out_iq | `0x11F50010` | 0 |
+| 6 | rc_status | `0x22F50010` | 0 |
+
+### P.2 The trigger — and the one that keeps the source
+
+There are **two** trigger sequences, and this was the key confusion:
+
+* **Loopback (`SET_RX_METER` arm, `0x40342004 = 0x01000101 → 0x01000109`)** fills
+  the whole 64 KiB buffer but **reverts `0x40342000` to its default on trigger** —
+  writing a custom mux and then this trigger loses the mux.
+* **Source-select (testmode capture-start `0x00165004`, `0x40342004 = 0x309`,
+  then poll `0x40342228` bit 31)** *keeps* the mux. Confirmed live: writing
+  `0x44F10010` then `0x309` leaves `0x40342000 = 0x44F10010` and the capture
+  completes. The full-length setup also needs `0x403420F4[19:0] = 0x11123` and the
+  `0x40342278/27C` routing that testmode's caller (`0x0016A50E`, the LOFT/COB
+  calibration state machine) programs from runtime values.
+
+With `0x309` + the calibration `0x403420F4` value the capture completed but only
+`end_addr = 0x500` (160 samples): that value is the calibration path's short
+length. A general full-length antenna capture needs the routing/length that only
+the large calibration routine sets up.
+
+### P.3 Live firmware patching over USB (no driver, no reboot)
+
+`lmacfw_rf` runs from RAM at `0x00120000` (§O.2), and `DBG_MEM_BLOCK_WRITE`
+writes RAM — including the code region. So the running firmware can be patched in
+place, no file changes and no `sudo`, and it self-restores on the next chip
+reboot. Two 4-byte writes turn `SET_RX_METER` from a loopback into an
+antenna-tap capture:
+
+| addr (RAM) | original | patched | effect |
+|---|---|---|---|
+| `0x001259D8` | `0x00F70410` | `0x44F10010` | arm's mux constant → `rx_data_iq` |
+| `0x00125950` | `0x5280F042` (`orr r2,#0x10000000`) | `0xBF00BF00` (two `nop`) | drop the internal-tone enable |
+
+The patch demonstrably executed: after it, the buffer's even interleave — the
+bit-identical rotating int16 reference tone under stock firmware (§O.4) — became a
+**stuck constant**, i.e. the loopback tone was gone. So there is no instruction
+cache defeating a RAM code patch here.
+
+### P.4 Result: still no antenna
+
+With the patch live (mux `rx_data_iq`, tone off), a confirmed −6 dBm external
+jammer at +2 MHz (fcsok 0/… during capture) produced **no spectral response** —
+the odd (12-bit) interleave stayed ~1100-LSB noise, the even interleave a dead
+constant. The same held for `adc_in` and `rc_adc` via the `0x309` path. So:
+
+> The `lmacfw_rf` capture engine is fully drivable and its format/mux/trigger are
+> known, but the **live antenna receive path is not routed into the capture
+> buffer** in this firmware. The receiver clearly works (it counts FCS-OK frames
+> and a jammer kills them), yet nothing on the antenna reaches `0x00100000`
+> through any exposed tap. The capture is wired for TX/RX **calibration
+> loopback**, and the `rx_data_iq` tap is not fed (or not clocked) outside the
+> full calibration datapath that `0x0016A50E` sets up.
+
+### P.5 What acquiring antenna IQ would actually take
+
+Not achievable by register configuration alone from this firmware. The remaining
+options, in rough order of effort:
+
+1. **Replicate the full calibration datapath bring-up** — port the register /
+   clock / routing sequence that `0x0016A50E` performs (`0x403420D4`,
+   `0x40342270 = 0xFFC080`, `0x40342278/27C`, and its sub-calls `0x168CAC`,
+   `0x169288`, …) so the `rx_data_iq` tap is actually clocked, then `0x309`-arm a
+   full-length capture. Large, but self-contained, and patchable live over USB
+   with the technique in P.3.
+2. **A bigger firmware patch** that adds a dedicated "capture antenna to
+   `0x100000`" routine reachable from a spare `rftest` sub-command, reusing the
+   normal-RX datapath that already demodulates packets.
+3. **A different firmware** — the `testmode*` images expose the `dump rx_data_iq`
+   path directly over UART (needs the board's UART pads), and the `phydump256k`
+   build is the same pipeline with a larger buffer.
+
+All three are real projects rather than the quick register pokes tried here; none
+is blocked by anything discovered so far, and the live-patch channel (P.3) makes
+iterating on (1)/(2) practical without reflashing.

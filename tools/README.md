@@ -11,6 +11,7 @@ on hardware and which are static analysis only.
 | `extract_testmode_cmds.py` | Python 3 | Recover the shell command table from a `testmode*.bin` image by brute-forcing the 64 KiB-aligned load base and walking the 16-byte records. |
 | `tinysa.py` | Python 3 | Minimal tinySA / tinySA4 serial control (`talk()`, `sweep()`) used to confirm TX output, and as an external signal generator (`mode output` + `output on`). |
 | `capture_fft.py` | Python 3 (numpy) | FFT-analyse a buffer dumped from the IQ capture engine at `0x100000`. Unpacks the lmacfw_rf format (two's-complement 12-bit, 8-byte stride) verified by disassembly; A/B compares tone on/off. See doc Appendix O. |
+| `rf_daq.py` | Python 3 | Drive the lmacfw_rf IQ capture DAQ over USB (source-select `0x309` arm, tap mux table) and optionally live-patch the running firmware to retask `SET_RX_METER`. Research scaffolding for antenna-IQ work — see doc Appendix P. |
 
 ## `aic-memtool`
 
